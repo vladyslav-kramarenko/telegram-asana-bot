@@ -1,0 +1,17 @@
+{
+    "message": {
+      "chat": {
+        "id": 123456789,
+        "title": "Telegram Support Group"
+      },
+      "message_id": 11,
+      "text": "@YourBotName", 
+      "reply_to_message": {
+        "message_id": 10,
+        "text": "Where can I find the warranty info?",
+        "from": {
+          "first_name": "Alice"
+        }
+      }
+    }
+  }
