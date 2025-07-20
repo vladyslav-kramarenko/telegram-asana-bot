@@ -1,17 +1,12 @@
 #!/bin/bash
 
-# Load .env vars
-set -a
-source .env
-set +a
-
 echo "🚀 Deploying Cloud Function..."
 gcloud functions deploy telegram_asana_webhook \
   --runtime python310 \
   --trigger-http \
   --allow-unauthenticated \
   --entry-point telegram_asana_webhook \
-  --set-env-vars TELEGRAM_TOKEN=$TELEGRAM_TOKEN,ASANA_TOKEN=$ASANA_TOKEN,ASANA_PROJECT_ID=$ASANA_PROJECT_ID \
+  --env-vars-file env.yaml \
   --region=us-central1
 
 echo "⏳ Waiting a few seconds for deployment..."
@@ -30,6 +25,8 @@ fi
 echo "✅ Function URL: $URL"
 
 echo "🔗 Setting Telegram webhook..."
+# Get token from the yaml file to ensure it's correct
+TELEGRAM_TOKEN=$(grep 'TELEGRAM_TOKEN:' env.yaml | awk '{print $2}' | tr -d '"')
 RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/setWebhook?url=$URL")
 echo "$RESPONSE" | jq
 
