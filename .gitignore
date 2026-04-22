@@ -3,3 +3,4 @@
 env.yaml
 hq.env.yaml
 preconfig.sh
+.DS_Store
