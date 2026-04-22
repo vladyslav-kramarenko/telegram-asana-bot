@@ -5,6 +5,8 @@ import datetime
 import requests
 import gspread
 from google.auth import default as google_auth_default
+from google.cloud import tasks_v2
+from google.protobuf import timestamp_pb2
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -13,8 +15,11 @@ ASANA_TOKEN              = os.environ.get("ASANA_TOKEN")
 DEFAULT_ASANA_PROJECT_ID = os.environ.get("DEFAULT_ASANA_PROJECT_ID")
 GOOGLE_SHEET_ID          = os.environ.get("GOOGLE_SHEET_ID")
 DUE_DATE_DAYS_STR        = os.environ.get("DUE_DATE_DAYS")
+CLOUD_TASKS_QUEUE        = os.environ.get("CLOUD_TASKS_QUEUE")  # projects/PROJECT/locations/REGION/queues/QUEUE
+GCF_URL                  = os.environ.get("GCF_URL")            # this function's own URL
 
 SECTION_COMMANDS   = {"/emergency", "/hq", "/franchisees"}
+FINALIZE_COMMANDS  = SECTION_COMMANDS | {"/done"}
 CACHE_TTL          = 300  # seconds
 RATE_LIMIT_MAX     = 5    # max messages per window per user
 RATE_LIMIT_WINDOW  = 60   # seconds
@@ -23,6 +28,7 @@ RATE_LIMIT_WINDOW  = 60   # seconds
 
 BOT_USERNAME     = None
 _spreadsheet     = None
+_tasks_client    = None
 _users_cache     = None
 _users_cache_ts  = 0.0
 _rate_limit      = {}     # user_id → [timestamp, ...]
@@ -65,6 +71,12 @@ def get_user_project(user_id):
         return str(row.get("asana_project_id") or "") or DEFAULT_ASANA_PROJECT_ID
     return DEFAULT_ASANA_PROJECT_ID
 
+def get_user_assignee(user_id):
+    row = lookup_user(user_id)
+    if row:
+        return str(row.get("email") or "").strip() or None
+    return None
+
 def is_rate_limited(user_id):
     now  = time.time()
     hits = [t for t in _rate_limit.get(user_id, []) if now - t < RATE_LIMIT_WINDOW]
@@ -79,13 +91,14 @@ def is_authorized_private(user_id):
 
 # ── SESSION — Pending tab ─────────────────────────────────────────────────────
 
-def session_add(user_id, chat_id, content, photo_file_id="", forwarded_from=""):
+def session_add(user_id, chat_id, content, photo_file_id="", forwarded_from="", is_user_text=False, mode="auto"):
     try:
         _get_spreadsheet().worksheet("Pending").append_row([
             str(user_id), str(chat_id),
             content or "",
             photo_file_id or "",
-            forwarded_from or "",
+            "__text__" if is_user_text else (forwarded_from or ""),
+            mode,
             datetime.datetime.utcnow().isoformat(),
         ])
         return True
@@ -111,6 +124,54 @@ def session_clear(user_id):
     except Exception as e:
         print(f"❌ session_clear failed: {e}")
 
+def is_in_draft_session(user_id):
+    """True if the user explicitly started a /task draft (has mode=draft rows)."""
+    return any(str(r.get("mode", "")) == "draft" for r in session_get(user_id))
+
+# ── CLOUD TASKS — auto-finalize for simple flow ───────────────────────────────
+
+def _get_tasks_client():
+    global _tasks_client
+    if _tasks_client is None:
+        _tasks_client = tasks_v2.CloudTasksClient()
+    return _tasks_client
+
+def schedule_auto_finalize(user_id, chat_id, delay_seconds=5):
+    if not CLOUD_TASKS_QUEUE or not GCF_URL:
+        print("⚠️ CLOUD_TASKS_QUEUE or GCF_URL not set — auto-finalize disabled")
+        return
+    ts = timestamp_pb2.Timestamp()
+    ts.FromDatetime(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay_seconds))
+    task = tasks_v2.Task(
+        name=f"{CLOUD_TASKS_QUEUE}/tasks/finalize-{user_id}",
+        http_request=tasks_v2.HttpRequest(
+            http_method=tasks_v2.HttpMethod.POST,
+            url=GCF_URL,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"_auto_finalize": {"user_id": user_id, "chat_id": chat_id}}).encode(),
+        ),
+        schedule_time=ts,
+    )
+    try:
+        _get_tasks_client().create_task(parent=CLOUD_TASKS_QUEUE, task=task)
+        print(f"✅ Auto-finalize scheduled for user {user_id} in {delay_seconds}s")
+    except Exception as e:
+        if "ALREADY_EXISTS" in str(e) or "409" in str(e):
+            print(f"📎 Auto-finalize already scheduled for user {user_id}")
+        else:
+            print(f"❌ schedule_auto_finalize failed: {e}")
+
+def handle_auto_finalize(user_id, chat_id):
+    pending = session_get(user_id)
+    if not pending:
+        print(f"⚠️ Auto-finalize for {user_id}: nothing pending (already handled)")
+        return
+    row         = lookup_user(user_id)
+    author_name = str(row.get("display_name", "Unknown")) if row else "Unknown"
+    session_clear(user_id)
+    finalize_task(user_id, chat_id, None, pending, "", None, author_name, "Private Chat",
+                  clear_session_after=False)
+
 # ── TASK CONTENT BUILDER ── OpenAI swap point ─────────────────────────────────
 
 def build_task_content(pending_items, user_description, author_name, source, command=None):
@@ -126,8 +187,15 @@ def build_task_content(pending_items, user_description, author_name, source, com
       command:          str | None — e.g. "/hq", "/emergency"
     Returns: (task_name: str, notes: str)
     """
+    text_items    = [i for i in pending_items if i.get("forwarded_from") == "__text__"]
+    forward_items = [i for i in pending_items if i.get("forwarded_from") != "__text__"]
+
+    # User-typed text from session takes over if no explicit description was passed
+    if not user_description and text_items:
+        user_description = " ".join(i.get("content", "") for i in text_items).strip()
+
     parts = []
-    for item in pending_items:
+    for item in forward_items:
         origin  = item.get("forwarded_from", "")
         content = (item.get("content") or "").strip()
         if content:
@@ -148,14 +216,14 @@ def build_task_content(pending_items, user_description, author_name, source, com
     else:
         base_name = f"Task from {author_name} in {source}"
 
-    prefix    = f"{command.lstrip('/').upper()}_" if command else ""
+    prefix    = f"{command.lstrip('/').upper()}_" if command and command in SECTION_COMMANDS else ""
     task_name = f"{prefix}{base_name}"
 
     return task_name, "\n\n".join(note_sections)
 
 # ── ASANA API ─────────────────────────────────────────────────────────────────
 
-def asana_create_task(task_name, notes, project_id):
+def asana_create_task(task_name, notes, project_id, assignee=None):
     if not ASANA_TOKEN or not project_id:
         print("❌ Missing ASANA_TOKEN or project_id.")
         return False, "Missing Asana config."
@@ -167,6 +235,9 @@ def asana_create_task(task_name, notes, project_id):
             "projects": [project_id],
         }
     }
+
+    if assignee:
+        payload["data"]["assignee"] = assignee
 
     if DUE_DATE_DAYS_STR and DUE_DATE_DAYS_STR.isdigit():
         due = datetime.date.today() + datetime.timedelta(days=int(DUE_DATE_DAYS_STR))
@@ -252,6 +323,15 @@ def extract_section_command(text, entities):
                 return raw
     return None
 
+def extract_finalize_command(text, entities):
+    """Returns the first /done|/emergency|/hq|/franchisees command, or None."""
+    for e in (entities or []):
+        if e.get("type") == "bot_command":
+            raw = text[e["offset"]: e["offset"] + e["length"]].split("@")[0].lower()
+            if raw in FINALIZE_COMMANDS:
+                return raw
+    return None
+
 def has_cancel_command(text, entities):
     for e in (entities or []):
         if e.get("type") == "bot_command":
@@ -278,7 +358,7 @@ def finalize_task(user_id, chat_id, msg_id, pending_items, user_description,
         return
 
     task_name, notes  = build_task_content(pending_items, user_description, author_name, source, command)
-    success, result   = asana_create_task(task_name, notes, project_id)
+    success, result   = asana_create_task(task_name, notes, project_id, get_user_assignee(user_id))
 
     if not success:
         tg_send(chat_id, "⚠️ Could not create Asana task. Check logs.", reply_to=msg_id)
@@ -379,55 +459,85 @@ def handle_private_message(message):
         tg_send(chat_id, "🗑️ Draft cleared.", reply_to=msg_id)
         return
 
-    command = extract_section_command(text, entities)
+    command    = extract_finalize_command(text, entities)
+    in_session = is_in_draft_session(user_id)
 
-    # Forwarded message or bare media (no section command) → add to session draft
-    if is_fwd or (photo_id and not command):
-        forwarded_from = ""
-        if is_fwd:
-            origin = message.get("forward_origin", {})
-            ftype  = origin.get("type", "")
-            if ftype == "user":
-                forwarded_from = origin.get("sender_user", {}).get("first_name", "")
-            elif ftype == "channel":
-                forwarded_from = origin.get("chat", {}).get("title", "")
-            elif ftype == "hidden_user":
-                forwarded_from = origin.get("sender_user_name", "Hidden")
+    # /task — enter multi-message draft mode
+    for e in entities:
+        if e.get("type") == "bot_command":
+            if text[e["offset"]: e["offset"] + e["length"]].split("@")[0].lower() == "/task":
+                if in_session:
+                    tg_send(chat_id, "⚠️ You already have a draft. /cancel it first or finalize with /done.", reply_to=msg_id)
+                else:
+                    session_add(user_id, chat_id, "", is_user_text=True, mode="draft")  # sentinel
+                    tg_send(
+                        chat_id,
+                        "📋 *Draft started.* Forward messages and add text, then:\n"
+                        "`/done` — create task\n"
+                        "`/emergency`, `/hq`, `/franchisees` — create in section\n"
+                        "`/cancel` — discard",
+                        reply_to=msg_id,
+                    )
+                return
 
+    # Finalize command (/done, /emergency, /hq, /franchisees)
+    if command:
+        description = strip_entity_tokens(text, entities, {"bot_command"})
+        pending     = session_get(user_id)
+        if not pending and not description:
+            tg_send(chat_id, "⚠️ Nothing to create a task from.", reply_to=msg_id)
+            return
+        if not pending:
+            pending = [{"content": description, "photo_file_id": photo_id or "", "forwarded_from": ""}]
+            description = ""
+        finalize_task(user_id, chat_id, msg_id, pending, description, command, author_name,
+                      "Private Chat", clear_session_after=True)
+        return
+
+    # Extract forwarded_from name for forward messages
+    forwarded_from = ""
+    if is_fwd:
+        origin = message.get("forward_origin", {})
+        ftype  = origin.get("type", "")
+        if ftype == "user":
+            forwarded_from = origin.get("sender_user", {}).get("first_name", "")
+        elif ftype == "channel":
+            forwarded_from = origin.get("chat", {}).get("title", "")
+        elif ftype == "hidden_user":
+            forwarded_from = origin.get("sender_user_name", "Hidden")
+
+    if is_fwd or photo_id:
         content = text or ("[Image]" if photo_id else "[Forwarded media]")
-        if session_add(user_id, chat_id, content, photo_id, forwarded_from):
+        if in_session:
+            # Draft mode — add to session, prompt for more
+            session_add(user_id, chat_id, content, photo_id, forwarded_from, mode="draft")
             count = len(session_get(user_id))
             tg_send(
                 chat_id,
                 f"📎 *{count} message{'s' if count > 1 else ''} in draft.*\n"
-                "Forward more, or finalize:\n"
-                "`/emergency`, `/hq`, `/franchisees` — add a description after the command\n"
-                "`/cancel` — discard draft",
+                "`/done` · `/emergency` · `/hq` · `/franchisees` · `/cancel`",
                 reply_to=msg_id,
             )
         else:
-            tg_send(chat_id, "⚠️ Could not save message. Try again.", reply_to=msg_id)
-        return
+            # Simple mode — buffer in Pending, schedule auto-finalize in 5s
+            session_add(user_id, chat_id, content, photo_id, forwarded_from, mode="auto")
+            schedule_auto_finalize(user_id, chat_id)
 
-    # Command or plain text → finalize draft (or create immediate task)
-    description = strip_entity_tokens(text, entities, {"bot_command"})
-    pending     = session_get(user_id)
-
-    if not pending and not description:
-        tg_send(
-            chat_id,
-            "⚠️ Nothing to create a task from. Forward a message first, or send text.",
-            reply_to=msg_id,
-        )
-        return
-
-    if not pending:
-        # Direct text with no prior session → create task immediately
-        pending     = [{"content": description, "photo_file_id": photo_id or "", "forwarded_from": ""}]
-        description = ""
-
-    finalize_task(user_id, chat_id, msg_id, pending, description, command, author_name,
-                  "Private Chat", clear_session_after=True)
+    elif text:
+        if in_session:
+            # Draft mode — add text as description
+            session_add(user_id, chat_id, text, is_user_text=True, mode="draft")
+            count = len(session_get(user_id))
+            tg_send(
+                chat_id,
+                f"📎 *{count} message{'s' if count > 1 else ''} in draft.*\n"
+                "`/done` · `/emergency` · `/hq` · `/franchisees` · `/cancel`",
+                reply_to=msg_id,
+            )
+        else:
+            # Simple mode — buffer text too so it joins any forwards in the same batch
+            session_add(user_id, chat_id, text, is_user_text=True, mode="auto")
+            schedule_auto_finalize(user_id, chat_id)
 
 # ── WEBHOOK ENTRY POINT ───────────────────────────────────────────────────────
 
@@ -442,6 +552,15 @@ def telegram_asana_webhook(request):
         data = request.get_json()
         if not data:
             return "Bad Request", 400
+
+        # Cloud Tasks auto-finalize callback
+        if "_auto_finalize" in data:
+            if not request.headers.get("X-CloudTasks-QueueName"):
+                print("⚠️ _auto_finalize received without Cloud Tasks header — ignored")
+                return "ok", 200
+            info = data["_auto_finalize"]
+            handle_auto_finalize(int(info["user_id"]), int(info["chat_id"]))
+            return "ok", 200
 
         print("📥 Payload:", json.dumps(data, indent=2))
 
