@@ -1,17 +1,68 @@
 {
+  "group_reply_mention": {
     "message": {
-      "chat": {
-        "id": 123456789,
-        "title": "Telegram Support Group"
-      },
+      "chat": { "id": -100123456789, "type": "supergroup", "title": "Franchise Support" },
       "message_id": 11,
-      "text": "@YourBotName", 
+      "from": { "id": 99999, "first_name": "Vlad" },
+      "text": "@YourBotName /hq Please check this",
+      "entities": [
+        { "type": "mention", "offset": 0, "length": 12 },
+        { "type": "bot_command", "offset": 13, "length": 3 }
+      ],
       "reply_to_message": {
         "message_id": 10,
         "text": "Where can I find the warranty info?",
-        "from": {
-          "first_name": "Alice"
-        }
+        "from": { "id": 88888, "first_name": "Alice" }
       }
     }
+  },
+
+  "group_standalone_mention_with_section": {
+    "message": {
+      "chat": { "id": -100123456789, "type": "supergroup", "title": "Franchise Support" },
+      "message_id": 20,
+      "from": { "id": 99999, "first_name": "Vlad" },
+      "text": "@YourBotName /emergency Roof leak at location #42",
+      "entities": [
+        { "type": "mention", "offset": 0, "length": 12 },
+        { "type": "bot_command", "offset": 13, "length": 10 }
+      ]
+    }
+  },
+
+  "private_forward_single": {
+    "message": {
+      "chat": { "id": 99999, "type": "private" },
+      "message_id": 42,
+      "from": { "id": 99999, "first_name": "Vlad" },
+      "forward_origin": {
+        "type": "user",
+        "date": 1700000000,
+        "sender_user": { "id": 88888, "first_name": "Alice" }
+      },
+      "forward_date": 1700000000,
+      "text": "Where can I find the warranty info?"
+    }
+  },
+
+  "private_finalize_with_command": {
+    "message": {
+      "chat": { "id": 99999, "type": "private" },
+      "message_id": 43,
+      "from": { "id": 99999, "first_name": "Vlad" },
+      "text": "/hq Needs urgent review",
+      "entities": [
+        { "type": "bot_command", "offset": 0, "length": 3 }
+      ]
+    }
+  },
+
+  "private_direct_text": {
+    "message": {
+      "chat": { "id": 99999, "type": "private" },
+      "message_id": 44,
+      "from": { "id": 99999, "first_name": "Vlad" },
+      "text": "Follow up on the Chicago location complaint from last week"
+    }
   }
+}

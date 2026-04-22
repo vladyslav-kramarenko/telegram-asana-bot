@@ -1,293 +1,463 @@
 import os
 import json
-import requests
+import time
 import datetime
+import requests
+import gspread
+from google.auth import default as google_auth_default
 
-# --- Configuration ---
-# These are loaded from the Google Cloud Function's environment variables.
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ASANA_TOKEN = os.environ.get("ASANA_TOKEN")
-ASANA_PROJECT_ID = os.environ.get("ASANA_PROJECT_ID")
-DUE_DATE_DAYS_STR = os.environ.get("DUE_DATE_DAYS") # New: Days to set due date
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 
-# Whitelist of user IDs who can create tasks in private chats.
-# This should be a comma-separated string of numbers, e.g., "12345678,87654321"
-ALLOWED_USER_IDS_STR = os.environ.get("ALLOWED_USER_IDS", "")
-ALLOWED_USER_IDS = [int(uid.strip()) for uid in ALLOWED_USER_IDS_STR.split(',') if uid.strip()]
+TELEGRAM_TOKEN           = os.environ.get("TELEGRAM_TOKEN")
+ASANA_TOKEN              = os.environ.get("ASANA_TOKEN")
+DEFAULT_ASANA_PROJECT_ID = os.environ.get("DEFAULT_ASANA_PROJECT_ID")
+GOOGLE_SHEET_ID          = os.environ.get("GOOGLE_SHEET_ID")
+DUE_DATE_DAYS_STR        = os.environ.get("DUE_DATE_DAYS")
 
-# --- Global variable to cache the bot's username ---
-BOT_USERNAME = None
+SECTION_COMMANDS   = {"/emergency", "/hq", "/franchisees"}
+CACHE_TTL          = 300  # seconds
+RATE_LIMIT_MAX     = 5    # max messages per window per user
+RATE_LIMIT_WINDOW  = 60   # seconds
 
-def get_bot_username():
-    """
-    Fetches the bot's own username using the getMe method and caches it.
-    This is crucial for multi-bot environments.
-    """
-    global BOT_USERNAME
-    if BOT_USERNAME is None:
-        print("🤖 Bot username not cached. Fetching from Telegram...")
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe"
+# ── IN-MEMORY CACHE (warm-start safe) ────────────────────────────────────────
+
+BOT_USERNAME     = None
+_spreadsheet     = None
+_users_cache     = None
+_users_cache_ts  = 0.0
+_rate_limit      = {}     # user_id → [timestamp, ...]
+
+# ── GOOGLE SHEETS CLIENT ──────────────────────────────────────────────────────
+
+def _get_spreadsheet():
+    global _spreadsheet
+    if _spreadsheet is None:
+        creds, _ = google_auth_default(
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        _spreadsheet = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID)
+    return _spreadsheet
+
+# ── SHEETS DATA ACCESSORS ─────────────────────────────────────────────────────
+
+def _refresh_users():
+    global _users_cache, _users_cache_ts
+    _users_cache    = _get_spreadsheet().worksheet("Users").get_all_records()
+    _users_cache_ts = time.time()
+
+def get_all_users():
+    if _users_cache is None or time.time() - _users_cache_ts > CACHE_TTL:
         try:
-            response = requests.get(url)
-            response.raise_for_status()
-            BOT_USERNAME = response.json()["result"]["username"]
-            print(f"✅ Bot username is '@{BOT_USERNAME}'")
+            _refresh_users()
         except Exception as e:
-            print(f"🔥🔥🔥 CRITICAL: Could not fetch bot username. Error: {e}")
-            # In case of failure, we can't proceed reliably.
-            BOT_USERNAME = "" # Set to empty to avoid repeated calls
-    return BOT_USERNAME
+            print(f"⚠️ Users sheet error: {type(e).__name__}: {e}")
+    return _users_cache or []
+
+def lookup_user(user_id):
+    for row in get_all_users():
+        if str(row.get("user_id")) == str(user_id):
+            return row
+    return None
+
+def get_user_project(user_id):
+    row = lookup_user(user_id)
+    if row:
+        return str(row.get("asana_project_id") or "") or DEFAULT_ASANA_PROJECT_ID
+    return DEFAULT_ASANA_PROJECT_ID
+
+def is_rate_limited(user_id):
+    now  = time.time()
+    hits = [t for t in _rate_limit.get(user_id, []) if now - t < RATE_LIMIT_WINDOW]
+    hits.append(now)
+    _rate_limit[user_id] = hits
+    return len(hits) > RATE_LIMIT_MAX
+
+def is_authorized_private(user_id):
+    """Private chat requires the user to exist in the Users sheet."""
+    return lookup_user(user_id) is not None
 
 
-def create_asana_task(task_details):
-    """Creates a task in Asana from a dictionary of details."""
-    question = task_details.get("question")
-    user = task_details.get("user")
-    group = task_details.get("group")
+# ── SESSION — Pending tab ─────────────────────────────────────────────────────
 
-    if not all([ASANA_TOKEN, ASANA_PROJECT_ID]):
-        print("❌ ERROR: Asana environment variables are not set correctly.")
-        return False, "Configuration error: Missing Asana token or project ID."
-
-    url = "https://app.asana.com/api/1.0/tasks"
-    headers = {
-        "Authorization": f"Bearer {ASANA_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "data": {
-            "projects": [ASANA_PROJECT_ID],
-            "name": f"Support Task from {user} in '{group}'",
-            "notes": f"Task Details:\n{question}\n\nFrom: {user}\nSource: {group}"
-        }
-    }
-    
-    # NEW: Add due date if configured
-    if DUE_DATE_DAYS_STR and DUE_DATE_DAYS_STR.isdigit():
-        try:
-            days_to_add = int(DUE_DATE_DAYS_STR)
-            due_date = datetime.date.today() + datetime.timedelta(days=days_to_add)
-            # Asana API uses 'due_on' for setting a date-only due date.
-            data["data"]["due_on"] = due_date.isoformat()
-            print(f"✅ Setting due date to {data['data']['due_on']}")
-        except ValueError:
-            print(f"⚠️ Invalid value for DUE_DATE_DAYS: {DUE_DATE_DAYS_STR}. Skipping due date.")
-
+def session_add(user_id, chat_id, content, photo_file_id="", forwarded_from=""):
     try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
-        response_data = response.json()
-        print(f"✅ Asana task created successfully: {response_data}")
-        return True, response_data
-    except requests.exceptions.RequestException as e:
-        error_message = f"❌ FAILED to create Asana task. Error: {e}"
-        if e.response is not None:
-            error_message += f" | Asana API Response: {e.response.text}"
-        print(error_message)
-        return False, error_message
-
-def attach_image_to_asana_task(task_gid, file_id):
-    """Downloads an image from Telegram and attaches it to an Asana task."""
-    try:
-        print(f"Getting file path for file_id: {file_id}")
-        get_file_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile"
-        file_response = requests.get(get_file_url, params={"file_id": file_id})
-        file_response.raise_for_status()
-        file_path = file_response.json()["result"]["file_path"]
-        file_name = file_path.split('/')[-1]
-
-        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
-        
-        content_type = 'application/octet-stream'
-        if file_name.lower().endswith(('.jpg', '.jpeg')):
-            content_type = 'image/jpeg'
-        elif file_name.lower().endswith('.png'):
-            content_type = 'image/png'
-        
-        print(f"Streaming {file_name} as {content_type} to Asana task {task_gid}")
-        with requests.get(download_url, stream=True) as image_response:
-            image_response.raise_for_status()
-            
-            attachment_url = f"https://app.asana.com/api/1.0/tasks/{task_gid}/attachments"
-            headers = { "Authorization": f"Bearer {ASANA_TOKEN}" }
-            files = { 'file': (file_name, image_response.raw, content_type) }
-            
-            upload_response = requests.post(attachment_url, headers=headers, files=files)
-            upload_response.raise_for_status()
-
-        print("✅ Successfully attached image to Asana task.")
+        _get_spreadsheet().worksheet("Pending").append_row([
+            str(user_id), str(chat_id),
+            content or "",
+            photo_file_id or "",
+            forwarded_from or "",
+            datetime.datetime.utcnow().isoformat(),
+        ])
         return True
-
     except Exception as e:
-        print(f"❌ FAILED to attach image to Asana. Error: {e}")
+        print(f"❌ session_add failed: {e}")
         return False
 
-def send_telegram_confirmation(chat_id, message_id, asana_response):
-    """Sends a success confirmation message back to Telegram."""
-    task_url = asana_response.get("data", {}).get("permalink_url", "")
-    
-    reply_text = "✅ Task created in Asana!"
+def session_get(user_id):
+    try:
+        rows = _get_spreadsheet().worksheet("Pending").get_all_records()
+        return [r for r in rows if str(r.get("user_id")) == str(user_id)]
+    except Exception as e:
+        print(f"⚠️ session_get failed: {e}")
+        return []
+
+def session_clear(user_id):
+    try:
+        sheet   = _get_spreadsheet().worksheet("Pending")
+        rows    = sheet.get_all_records()
+        to_del  = [i + 2 for i, r in enumerate(rows) if str(r.get("user_id")) == str(user_id)]
+        for row_num in reversed(to_del):
+            sheet.delete_rows(row_num)
+    except Exception as e:
+        print(f"❌ session_clear failed: {e}")
+
+# ── TASK CONTENT BUILDER ── OpenAI swap point ─────────────────────────────────
+
+def build_task_content(pending_items, user_description, author_name, source, command=None):
+    """
+    Returns (task_name, notes) from forwarded messages + optional user description.
+
+    To integrate OpenAI: replace the body of this function.
+    Contract is stable — inputs and outputs are unchanged by that swap.
+      pending_items:    list of dicts with keys: content, forwarded_from, photo_file_id
+      user_description: str | None — the user's own typed note
+      author_name:      str
+      source:           str — group title or "Private Chat"
+      command:          str | None — e.g. "/hq", "/emergency"
+    Returns: (task_name: str, notes: str)
+    """
+    parts = []
+    for item in pending_items:
+        origin  = item.get("forwarded_from", "")
+        content = (item.get("content") or "").strip()
+        if content:
+            parts.append(f"[From {origin}]\n{content}" if origin else content)
+
+    raw = "\n\n---\n\n".join(parts) if parts else "[Forwarded media]"
+
+    note_sections = []
+    if user_description:
+        note_sections.append(f"Note: {user_description}")
+    note_sections.append(f"Content:\n{raw}")
+    note_sections.append(f"From: {author_name} | Source: {source}")
+
+    if user_description:
+        base_name = user_description[:80]
+    elif parts:
+        base_name = parts[0].split("\n")[-1][:80]  # skip [From X] prefix if present
+    else:
+        base_name = f"Task from {author_name} in {source}"
+
+    prefix    = f"{command.lstrip('/').upper()}_" if command else ""
+    task_name = f"{prefix}{base_name}"
+
+    return task_name, "\n\n".join(note_sections)
+
+# ── ASANA API ─────────────────────────────────────────────────────────────────
+
+def asana_create_task(task_name, notes, project_id):
+    if not ASANA_TOKEN or not project_id:
+        print("❌ Missing ASANA_TOKEN or project_id.")
+        return False, "Missing Asana config."
+
+    payload = {
+        "data": {
+            "name":     task_name,
+            "notes":    notes,
+            "projects": [project_id],
+        }
+    }
+
+    if DUE_DATE_DAYS_STR and DUE_DATE_DAYS_STR.isdigit():
+        due = datetime.date.today() + datetime.timedelta(days=int(DUE_DATE_DAYS_STR))
+        payload["data"]["due_on"] = due.isoformat()
+
+    try:
+        r = requests.post(
+            "https://app.asana.com/api/1.0/tasks",
+            headers={"Authorization": f"Bearer {ASANA_TOKEN}", "Content-Type": "application/json"},
+            json=payload,
+        )
+        r.raise_for_status()
+        print(f"✅ Asana task created: {r.json()['data'].get('gid')}")
+        return True, r.json()
+    except requests.exceptions.RequestException as e:
+        detail = e.response.text if e.response is not None else str(e)
+        print(f"❌ asana_create_task failed: {detail}")
+        return False, detail
+
+def asana_attach_image(task_gid, file_id):
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+            params={"file_id": file_id},
+        )
+        r.raise_for_status()
+        file_path = r.json()["result"]["file_path"]
+        file_name = file_path.split("/")[-1]
+        ext       = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
+        ctype     = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png"}.get(
+            ext, "application/octet-stream"
+        )
+        with requests.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", stream=True
+        ) as img:
+            img.raise_for_status()
+            upload = requests.post(
+                f"https://app.asana.com/api/1.0/tasks/{task_gid}/attachments",
+                headers={"Authorization": f"Bearer {ASANA_TOKEN}"},
+                files={"file": (file_name, img.raw, ctype)},
+            )
+            upload.raise_for_status()
+        print(f"✅ Image attached to task {task_gid}")
+        return True
+    except Exception as e:
+        print(f"❌ asana_attach_image failed: {e}")
+        return False
+
+# ── TELEGRAM HELPERS ──────────────────────────────────────────────────────────
+
+def get_bot_username():
+    global BOT_USERNAME
+    if BOT_USERNAME is None:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe")
+            r.raise_for_status()
+            BOT_USERNAME = r.json()["result"]["username"]
+            print(f"✅ Bot: @{BOT_USERNAME}")
+        except Exception as e:
+            print(f"🔥 getMe failed: {e}")
+            BOT_USERNAME = ""
+    return BOT_USERNAME
+
+def tg_send(chat_id, text, reply_to=None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload
+        )
+    except Exception as e:
+        print(f"⚠️ tg_send failed: {e}")
+
+# ── COMMAND & TEXT EXTRACTION ─────────────────────────────────────────────────
+
+def extract_section_command(text, entities):
+    """Returns the first /emergency|/hq|/franchisees command found in entities, or None."""
+    for e in (entities or []):
+        if e.get("type") == "bot_command":
+            raw = text[e["offset"]: e["offset"] + e["length"]].split("@")[0].lower()
+            if raw in SECTION_COMMANDS:
+                return raw
+    return None
+
+def has_cancel_command(text, entities):
+    for e in (entities or []):
+        if e.get("type") == "bot_command":
+            if text[e["offset"]: e["offset"] + e["length"]].split("@")[0].lower() == "/cancel":
+                return True
+    return False
+
+def strip_entity_tokens(text, entities, types_to_strip):
+    """Remove entity tokens by type from text (processes in reverse to preserve offsets)."""
+    result = text
+    for e in sorted((entities or []), key=lambda x: x["offset"], reverse=True):
+        if e.get("type") in types_to_strip:
+            s, end = e["offset"], e["offset"] + e["length"]
+            result  = result[:s] + result[end:]
+    return result.strip()
+
+# ── TASK FINALIZATION ─────────────────────────────────────────────────────────
+
+def finalize_task(user_id, chat_id, msg_id, pending_items, user_description,
+                  command, author_name, source, clear_session_after=False):
+    project_id = get_user_project(user_id)
+    if not project_id:
+        tg_send(chat_id, "⚠️ No Asana project configured for you. Contact your admin.", reply_to=msg_id)
+        return
+
+    task_name, notes  = build_task_content(pending_items, user_description, author_name, source, command)
+    success, result   = asana_create_task(task_name, notes, project_id)
+
+    if not success:
+        tg_send(chat_id, "⚠️ Could not create Asana task. Check logs.", reply_to=msg_id)
+        return
+
+    if clear_session_after:
+        session_clear(user_id)
+
+    task_gid = result.get("data", {}).get("gid")
+    if task_gid:
+        for item in pending_items:
+            if item.get("photo_file_id"):
+                asana_attach_image(task_gid, item["photo_file_id"])
+
+    task_url = result.get("data", {}).get("permalink_url", "")
+    label    = f" `{command.lstrip('/').upper()}_`" if command else ""
+    reply    = f"✅ Task{label} created!"
     if task_url:
-        reply_text += f"\n[View Task]({task_url})"
+        reply += f"\n[View in Asana]({task_url})"
+    tg_send(chat_id, reply, reply_to=msg_id)
 
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-        "chat_id": chat_id, "reply_to_message_id": message_id,
-        "text": reply_text, "parse_mode": "Markdown"
-    })
+# ── GROUP CHAT HANDLER ────────────────────────────────────────────────────────
 
-def send_telegram_error_reply(chat_id, message_id, error_text):
-    """Sends a user-facing error message back to Telegram."""
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
-        "chat_id": chat_id, "reply_to_message_id": message_id,
-        "text": f"⚠️ {error_text}"
-    })
+def handle_group_message(message):
+    bot_username = get_bot_username()
+    text         = message.get("text", "")
+    entities     = message.get("entities", [])
+    chat_info    = message.get("chat", {})
+    author_info  = message.get("from", {})
 
-def parse_message(message):
-    """
-    Parses a message and returns a tuple: (status, data).
-    """
-    chat_info = message.get("chat", {})
-    chat_type = chat_info.get("type")
-    
-    # --- Handler for Group/Supergroup Messages ---
-    if chat_type in ["group", "supergroup"]:
-        
-        # SELF-AWARENESS CHECK: Was *this specific bot* mentioned?
-        bot_username = get_bot_username()
-        text = message.get("text", "")
-        entities = message.get("entities", [])
-        
-        is_this_bot_mentioned = False
-        for entity in entities:
-            if entity.get("type") == "mention":
-                mention = text[entity.get("offset") : entity.get("offset") + entity.get("length")]
-                if mention == f"@{bot_username}":
-                    is_this_bot_mentioned = True
-                    break
-        
-        if not is_this_bot_mentioned:
-            return ("ignore", f"Another bot was mentioned, not @{bot_username}.")
+    is_mentioned = any(
+        text[e["offset"]: e["offset"] + e["length"]] == f"@{bot_username}"
+        for e in entities if e.get("type") == "mention"
+    )
+    if not is_mentioned:
+        return
 
-        # --- This bot was mentioned. Now, is it a reply or a standalone message? ---
-        if 'reply_to_message' in message:
-            print("🕵️ Parsing group reply mention.")
-            original_message = message.get("reply_to_message")
-            
-            reply_comment = text
-            mentions_to_remove = [reply_comment[e.get("offset"):e.get("offset")+e.get("length")] for e in entities if e.get("type") == "mention"]
-            for mention in set(mentions_to_remove):
-                reply_comment = reply_comment.replace(mention, "").strip()
+    chat_id = chat_info.get("id")
+    msg_id  = message.get("message_id")
+    source  = chat_info.get("title", "Group")
+    user_id = author_info.get("id")
+    command = extract_section_command(text, entities)
 
-            original_author_info = original_message.get("from", {})
-            original_text = original_message.get("text") or original_message.get("caption")
+    description = strip_entity_tokens(text, entities, {"mention", "bot_command"})
 
-            photo_file_id = None
-            original_content_description = original_text
-            if not original_content_description:
-                if "photo" in original_message:
-                    original_content_description = "[Image attached to task]"
-                    photo_file_id = original_message["photo"][-1].get("file_id")
-            elif "photo" in original_message:
-                 photo_file_id = original_message["photo"][-1].get("file_id")
+    if "reply_to_message" in message:
+        original      = message["reply_to_message"]
+        author_name   = original.get("from", {}).get("first_name", "Unknown")
+        original_text = original.get("text") or original.get("caption")
+        photo_id      = original["photo"][-1]["file_id"] if "photo" in original else None
+        if not original_text:
+            original_text = "[Image]" if photo_id else "[Media]"
+        content = (
+            f"Comment: {description}\n---\nOriginal: {original_text}"
+            if description else original_text
+        )
+    else:
+        author_name = author_info.get("first_name", "Unknown")
+        photo_id    = message["photo"][-1]["file_id"] if "photo" in message else None
+        content     = description or ("[Image]" if photo_id else "")
+        if not content:
+            tg_send(chat_id, "⚠️ Please add text or reply to a message.", reply_to=msg_id)
+            return
 
-            if not reply_comment and not original_content_description:
-                return ("error", "Please add a comment in your reply, or reply to a message that contains text or a caption.")
+    pending_items = [{"content": content, "photo_file_id": photo_id or "", "forwarded_from": ""}]
+    finalize_task(user_id, chat_id, msg_id, pending_items, "", command, author_name, source,
+                  clear_session_after=False)
 
-            final_question = f"Comment: {reply_comment}\n---\nOriginal Content: {original_content_description}" if reply_comment and original_content_description else reply_comment or original_content_description
+# ── PRIVATE CHAT HANDLER ──────────────────────────────────────────────────────
 
-            task_details = { "question": final_question, "user": original_author_info.get("first_name", "Unknown User"), "group": chat_info.get("title", "Unknown Group"), "chat_id": chat_info.get("id"), "message_id": message.get("message_id"), "photo_file_id": photo_file_id }
-            return ("success", task_details)
+def handle_private_message(message):
+    author_info = message.get("from", {})
+    user_id     = author_info.get("id")
+    chat_id     = message.get("chat", {}).get("id")
+    msg_id      = message.get("message_id")
+    author_name = author_info.get("first_name", "Unknown")
 
-        else: # Standalone mention
-            print("🕵️ Parsing standalone group mention.")
-            author_info = message.get("from", {})
-            
-            question = text
-            mentions_to_remove = [question[e.get("offset"):e.get("offset")+e.get("length")] for e in entities if e.get("type") == "mention"]
-            for mention in set(mentions_to_remove):
-                question = question.replace(mention, "").strip()
+    text     = message.get("text") or message.get("caption") or ""
+    entities = message.get("entities") or message.get("caption_entities") or []
 
-            photo_file_id = None
-            if "photo" in message:
-                photo_file_id = message["photo"][-1].get("file_id")
-                if not question: question = "[Image attached to task]"
-            
-            if not question:
-                return ("error", "Please mention me with some text or an image.")
+    # /myid works for everyone — no auth or rate-limit required
+    for e in entities:
+        if e.get("type") == "bot_command":
+            if text[e["offset"]: e["offset"] + e["length"]].split("@")[0].lower() == "/myid":
+                tg_send(chat_id, f"Your Telegram ID: `{user_id}`", reply_to=msg_id)
+                return
 
-            task_details = { "question": question, "user": author_info.get("first_name", "Unknown User"), "group": chat_info.get("title", "Unknown Group"), "chat_id": chat_info.get("id"), "message_id": message.get("message_id"), "photo_file_id": photo_file_id }
-            return ("success", task_details)
+    if not is_authorized_private(user_id):
+        if is_rate_limited(user_id):
+            print(f"🚫 Rate-limited unauthorized user {user_id}")
+        return
 
-    # --- Handler for Private Chats (Direct Messages & Forwards) ---
-    elif chat_type == "private":
-        print("🕵️ Parsing private message.")
-        author_info = message.get("from", {})
-        user_id = author_info.get("id")
-        
-        if not user_id or user_id not in ALLOWED_USER_IDS:
-            return ("error", "Sorry, you are not authorized to create tasks.")
-        
-        question = message.get("text") or message.get("caption")
-        photo_file_id = None
-        
-        if "photo" in message:
-            photo_file_id = message["photo"][-1].get("file_id")
-            if not question: question = "[Image attached to task]"
-        
-        if message.get("forward_origin") and not question:
-            question = "[Forwarded Media]"
+    photo_id = message["photo"][-1]["file_id"] if "photo" in message else None
+    is_fwd   = "forward_origin" in message or "forward_date" in message
 
-        if not question:
-            return ("error", "Please send a text message, a forward, or media with a caption.")
+    if has_cancel_command(text, entities):
+        session_clear(user_id)
+        tg_send(chat_id, "🗑️ Draft cleared.", reply_to=msg_id)
+        return
 
-        task_details = { "question": question, "user": author_info.get("first_name", "Unknown User"), "group": "Private Chat", "chat_id": chat_info.get("id"), "message_id": message.get("message_id"), "photo_file_id": photo_file_id }
-        return ("success", task_details)
-        
-    return ("ignore", "Unsupported chat type.")
+    command = extract_section_command(text, entities)
+
+    # Forwarded message or bare media (no section command) → add to session draft
+    if is_fwd or (photo_id and not command):
+        forwarded_from = ""
+        if is_fwd:
+            origin = message.get("forward_origin", {})
+            ftype  = origin.get("type", "")
+            if ftype == "user":
+                forwarded_from = origin.get("sender_user", {}).get("first_name", "")
+            elif ftype == "channel":
+                forwarded_from = origin.get("chat", {}).get("title", "")
+            elif ftype == "hidden_user":
+                forwarded_from = origin.get("sender_user_name", "Hidden")
+
+        content = text or ("[Image]" if photo_id else "[Forwarded media]")
+        if session_add(user_id, chat_id, content, photo_id, forwarded_from):
+            count = len(session_get(user_id))
+            tg_send(
+                chat_id,
+                f"📎 *{count} message{'s' if count > 1 else ''} in draft.*\n"
+                "Forward more, or finalize:\n"
+                "`/emergency`, `/hq`, `/franchisees` — add a description after the command\n"
+                "`/cancel` — discard draft",
+                reply_to=msg_id,
+            )
+        else:
+            tg_send(chat_id, "⚠️ Could not save message. Try again.", reply_to=msg_id)
+        return
+
+    # Command or plain text → finalize draft (or create immediate task)
+    description = strip_entity_tokens(text, entities, {"bot_command"})
+    pending     = session_get(user_id)
+
+    if not pending and not description:
+        tg_send(
+            chat_id,
+            "⚠️ Nothing to create a task from. Forward a message first, or send text.",
+            reply_to=msg_id,
+        )
+        return
+
+    if not pending:
+        # Direct text with no prior session → create task immediately
+        pending     = [{"content": description, "photo_file_id": photo_id or "", "forwarded_from": ""}]
+        description = ""
+
+    finalize_task(user_id, chat_id, msg_id, pending, description, command, author_name,
+                  "Private Chat", clear_session_after=True)
+
+# ── WEBHOOK ENTRY POINT ───────────────────────────────────────────────────────
 
 def telegram_asana_webhook(request):
-    """Main webhook handler for all Telegram updates."""
     if not TELEGRAM_TOKEN:
-        print("FATAL: TELEGRAM_TOKEN environment variable not set.")
+        print("FATAL: TELEGRAM_TOKEN not set.")
         return "Configuration error", 500
-    
-    # This ensures the bot knows its own name.
+
     get_bot_username()
 
     try:
         data = request.get_json()
-        if not data: return "Bad Request", 400
+        if not data:
+            return "Bad Request", 400
 
-        print("📥 Raw payload:", json.dumps(data, indent=2))
+        print("📥 Payload:", json.dumps(data, indent=2))
 
         message = data.get("message")
-        if not message: return "ok", 200
-        
-        status, result = parse_message(message)
+        if not message:
+            return "ok", 200
 
-        if status == "success":
-            task_details = result
-            print(f"📋 Parsed Task: {task_details}")
-            
-            success, asana_task_object = create_asana_task(task_details)
-            
-            if success:
-                photo_file_id = task_details.get("photo_file_id")
-                task_gid = asana_task_object.get("data", {}).get("gid")
-                if photo_file_id and task_gid:
-                    attach_image_to_asana_task(task_gid, photo_file_id)
-                send_telegram_confirmation(task_details["chat_id"], task_details["message_id"], asana_task_object)
-            else:
-                send_telegram_error_reply(task_details["chat_id"], task_details["message_id"], "Could not create a task in Asana. Please check the logs.")
-
-        elif status == "error":
-            send_telegram_error_reply(message.get("chat", {}).get("id"), message.get("message_id"), result)
-        else: # status == "ignore"
-            print(f"✅ Message ignored: {result}")
+        chat_type = message.get("chat", {}).get("type")
+        if chat_type in ("group", "supergroup"):
+            handle_group_message(message)
+        elif chat_type == "private":
+            handle_private_message(message)
 
     except Exception as e:
-        print(f"🔥�🔥 An unexpected error occurred: {e}")
         import traceback
+        print(f"🔥 Unexpected error: {e}")
         traceback.print_exc()
 
     return "ok", 200
