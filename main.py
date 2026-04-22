@@ -4,6 +4,7 @@ import time
 import datetime
 import requests
 import gspread
+from openai import OpenAI
 from google.auth import default as google_auth_default
 from google.cloud import tasks_v2
 from google.protobuf import timestamp_pb2
@@ -17,6 +18,8 @@ GOOGLE_SHEET_ID          = os.environ.get("GOOGLE_SHEET_ID")
 DUE_DATE_DAYS_STR        = os.environ.get("DUE_DATE_DAYS")
 CLOUD_TASKS_QUEUE        = os.environ.get("CLOUD_TASKS_QUEUE")  # projects/PROJECT/locations/REGION/queues/QUEUE
 GCF_URL                  = os.environ.get("GCF_URL")            # this function's own URL
+OPENAI_API_KEY           = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL             = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 SECTION_COMMANDS   = {"/emergency", "/hq", "/franchisees"}
 FINALIZE_COMMANDS  = SECTION_COMMANDS | {"/done"}
@@ -32,6 +35,16 @@ _tasks_client    = None
 _users_cache     = None
 _users_cache_ts  = 0.0
 _rate_limit      = {}     # user_id → [timestamp, ...]
+
+# ── OPENAI CLIENT ─────────────────────────────────────────────────────────────
+
+_openai_client = None
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is None and OPENAI_API_KEY:
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    return _openai_client
 
 # ── GOOGLE SHEETS CLIENT ──────────────────────────────────────────────────────
 
@@ -142,8 +155,11 @@ def schedule_auto_finalize(user_id, chat_id, delay_seconds=5):
         return
     ts = timestamp_pb2.Timestamp()
     ts.FromDatetime(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay_seconds))
+    # Unique name per message — deduplication happens at the Pending sheet level
+    # (first task to fire clears the session; subsequent tasks find nothing and skip)
+    task_name = f"{CLOUD_TASKS_QUEUE}/tasks/finalize-{user_id}-{int(time.time() * 1000)}"
     task = tasks_v2.Task(
-        name=f"{CLOUD_TASKS_QUEUE}/tasks/finalize-{user_id}",
+        name=task_name,
         http_request=tasks_v2.HttpRequest(
             http_method=tasks_v2.HttpMethod.POST,
             url=GCF_URL,
@@ -156,10 +172,7 @@ def schedule_auto_finalize(user_id, chat_id, delay_seconds=5):
         _get_tasks_client().create_task(parent=CLOUD_TASKS_QUEUE, task=task)
         print(f"✅ Auto-finalize scheduled for user {user_id} in {delay_seconds}s")
     except Exception as e:
-        if "ALREADY_EXISTS" in str(e) or "409" in str(e):
-            print(f"📎 Auto-finalize already scheduled for user {user_id}")
-        else:
-            print(f"❌ schedule_auto_finalize failed: {e}")
+        print(f"❌ schedule_auto_finalize failed: {e}")
 
 def handle_auto_finalize(user_id, chat_id):
     pending = session_get(user_id)
@@ -178,7 +191,7 @@ def build_task_content(pending_items, user_description, author_name, source, com
     """
     Returns (task_name, notes) from forwarded messages + optional user description.
 
-    To integrate OpenAI: replace the body of this function.
+    OpenAI hook: replace the body of this function to change generation.
     Contract is stable — inputs and outputs are unchanged by that swap.
       pending_items:    list of dicts with keys: content, forwarded_from, photo_file_id
       user_description: str | None — the user's own typed note
@@ -190,36 +203,88 @@ def build_task_content(pending_items, user_description, author_name, source, com
     text_items    = [i for i in pending_items if i.get("forwarded_from") == "__text__"]
     forward_items = [i for i in pending_items if i.get("forwarded_from") != "__text__"]
 
-    # User-typed text from session takes over if no explicit description was passed
     if not user_description and text_items:
         user_description = " ".join(i.get("content", "") for i in text_items).strip()
 
-    parts = []
+    # Build raw message list for display in notes
+    raw_parts = []
     for item in forward_items:
         origin  = item.get("forwarded_from", "")
         content = (item.get("content") or "").strip()
         if content:
-            parts.append(f"[From {origin}]\n{content}" if origin else content)
+            raw_parts.append(f"[Forwarded from {origin}]\n{content}" if origin else content)
+    if user_description:
+        raw_parts.append(f"[Note from {author_name}]\n{user_description}")
+    raw_block = "\n\n---\n\n".join(raw_parts) if raw_parts else "[Forwarded media]"
 
-    raw = "\n\n---\n\n".join(parts) if parts else "[Forwarded media]"
+    prefix = f"{command.lstrip('/').upper()}_" if command and command in SECTION_COMMANDS else ""
 
+    # ── Gemini generation ─────────────────────────────────────────────────────
+    try:
+        ai_lines = []
+        for item in forward_items:
+            origin  = item.get("forwarded_from", "Unknown")
+            content = (item.get("content") or "").strip()
+            if content:
+                ai_lines.append(f"[Forwarded from {origin}]\n{content}")
+        if user_description:
+            ai_lines.append(f"[Note from {author_name}]\n{user_description}")
+        ai_input = "\n\n---\n\n".join(ai_lines) if ai_lines else raw_block
+
+        system_prompt = (
+            "You are an operations assistant for Ideal Siding, a franchise business. "
+            "You receive messages forwarded from Telegram support chats and notes from franchise coordinators. "
+            "Your job is to generate a clear, concise task for the operations team.\n\n"
+            "Respond with valid JSON only in this exact shape:\n"
+            '{"title": "...", "description": "..."}\n\n'
+            "Rules:\n"
+            "- title: one sentence, max 80 chars, action-oriented\n"
+            "- description: 2-4 sentences summarising the situation, who reported it, and what action is needed\n"
+            "- Preserve names of people and locations from the messages\n"
+            "- Do not add information that is not in the messages"
+        )
+
+        client = _get_openai_client()
+        if not client:
+            raise ValueError("OPENAI_API_KEY not set")
+        resp     = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": ai_input},
+            ],
+            max_tokens=400,
+            temperature=0.3,
+        )
+        parsed   = json.loads(resp.choices[0].message.content)
+        ai_title = (parsed.get("title") or "").strip()[:80]
+        ai_desc  = (parsed.get("description") or "").strip()
+
+        if ai_title:
+            task_name = f"{prefix}{ai_title}"
+            notes     = f"{ai_desc}\n\n--- Original Messages ---\n\n{raw_block}"
+            notes    += f"\n\nFrom: {author_name} | Source: {source}"
+            return task_name, notes
+
+    except Exception as e:
+        print(f"⚠️ OpenAI build_task_content failed: {e} — falling back to plain text")
+
+    # ── Plain-text fallback ──────────────────────────────────────────────────
     note_sections = []
     if user_description:
         note_sections.append(f"Note: {user_description}")
-    note_sections.append(f"Content:\n{raw}")
+    note_sections.append(f"Content:\n{raw_block}")
     note_sections.append(f"From: {author_name} | Source: {source}")
 
     if user_description:
         base_name = user_description[:80]
-    elif parts:
-        base_name = parts[0].split("\n")[-1][:80]  # skip [From X] prefix if present
+    elif raw_parts:
+        base_name = raw_parts[0].split("\n")[-1][:80]
     else:
         base_name = f"Task from {author_name} in {source}"
 
-    prefix    = f"{command.lstrip('/').upper()}_" if command and command in SECTION_COMMANDS else ""
-    task_name = f"{prefix}{base_name}"
-
-    return task_name, "\n\n".join(note_sections)
+    return f"{prefix}{base_name}", "\n\n".join(note_sections)
 
 # ── ASANA API ─────────────────────────────────────────────────────────────────
 

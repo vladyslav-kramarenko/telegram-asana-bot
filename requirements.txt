@@ -2,3 +2,4 @@ requests
 gspread
 google-auth
 google-cloud-tasks
+openai
