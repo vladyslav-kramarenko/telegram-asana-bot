@@ -524,6 +524,26 @@ def handle_private_message(message):
         tg_send(chat_id, "🗑️ Draft cleared.", reply_to=msg_id)
         return
 
+    # /help — registered users only
+    for e in entities:
+        if e.get("type") == "bot_command":
+            if text[e["offset"]: e["offset"] + e["length"]].split("@")[0].lower() == "/help":
+                tg_send(chat_id, (
+                    "*Ideal Siding Support Bot*\n\n"
+                    "*Simple flow (recommended)*\n"
+                    "Just forward messages here — the bot bundles everything you send within 5 seconds into one Asana task.\n"
+                    "You can also type a note alongside the forwards — it will be included as context.\n\n"
+                    "*Draft flow (for multiple rounds of forwarding)*\n"
+                    "`/task` — start a draft session\n"
+                    "Forward messages and add notes, then finalize:\n"
+                    "`/done` — create task\n"
+                    "*Group chats*\n"
+                    "Mention `@IdealSupportBot` in a message or reply to create a task instantly.\n"
+                    "`/myid` — show your Telegram ID\n"
+                    "`/help` — show this message"
+                ), reply_to=msg_id)
+                return
+
     command    = extract_finalize_command(text, entities)
     in_session = is_in_draft_session(user_id)
 
