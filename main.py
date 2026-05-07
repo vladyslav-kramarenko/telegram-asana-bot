@@ -61,15 +61,20 @@ def _get_spreadsheet():
 
 def _refresh_users():
     global _users_cache, _users_cache_ts
-    _users_cache    = _get_spreadsheet().worksheet("Users").get_all_records()
-    _users_cache_ts = time.time()
+    for attempt in range(3):
+        try:
+            _users_cache    = _get_spreadsheet().worksheet("Users").get_all_records()
+            _users_cache_ts = time.time()
+            return
+        except Exception as e:
+            print(f"⚠️ Users sheet error (attempt {attempt + 1}): {type(e).__name__}: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)  # 1s, 2s
+    # all retries failed — keep existing cache if any
 
 def get_all_users():
     if _users_cache is None or time.time() - _users_cache_ts > CACHE_TTL:
-        try:
-            _refresh_users()
-        except Exception as e:
-            print(f"⚠️ Users sheet error: {type(e).__name__}: {e}")
+        _refresh_users()
     return _users_cache or []
 
 def lookup_user(user_id):
