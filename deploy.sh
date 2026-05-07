@@ -5,7 +5,7 @@ CONFIG_FILE="configs/env.yaml"
 
 echo "🚀 Deploying Cloud Function..."
 gcloud functions deploy ${FUNCTION_NAME} \
-  --runtime python310 \
+  --runtime python312 \
   --trigger-http \
   --allow-unauthenticated \
   --entry-point telegram_asana_webhook \
