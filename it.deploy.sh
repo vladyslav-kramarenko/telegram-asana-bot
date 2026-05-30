@@ -1,14 +1,14 @@
 #!/bin/bash
 
-FUNCTION_NAME="telegram_asana_webhook"
-CONFIG_FILE="configs/env.yaml"
+FUNCTION_NAME="it_support_webhook"
+CONFIG_FILE="configs/env_it.yaml"
 
 echo "🚀 Deploying ${FUNCTION_NAME}..."
 gcloud functions deploy ${FUNCTION_NAME} \
   --runtime python312 \
   --trigger-http \
   --allow-unauthenticated \
-  --entry-point telegram_asana_webhook \
+  --entry-point it_support_webhook \
   --env-vars-file ${CONFIG_FILE} \
   --max-instances 3 \
   --region=us-central1
@@ -27,6 +27,8 @@ if [[ -z "$URL" ]]; then
 fi
 
 echo "✅ Function URL: $URL"
+echo ""
+echo "⚠️  If this is the first deploy, update GCF_URL in configs/env_it.yaml with the URL above, then run ./it.deploy.sh again."
 
 echo "🔗 Setting Telegram webhook..."
 TELEGRAM_TOKEN=$(grep 'TELEGRAM_TOKEN:' ${CONFIG_FILE} | awk '{print $2}' | tr -d '"')
