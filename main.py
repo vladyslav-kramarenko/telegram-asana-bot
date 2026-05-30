@@ -476,7 +476,7 @@ def finalize_task(user_id, chat_id, msg_id, pending_items, user_description,
                 asana_attach_image(task_gid, item["photo_file_id"])
 
     task_url = result.get("data", {}).get("permalink_url", "")
-    reply    = "✅ Task created!"
+    reply    = f"✅ *{task_name}*"
     if task_url:
         reply += f"\n[View in Asana]({task_url})"
     tg_send(chat_id, reply, reply_to=msg_id)
