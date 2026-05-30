@@ -39,6 +39,7 @@ _tasks_client    = None
 _users_cache     = None
 _users_cache_ts  = 0.0
 _rate_limit      = {}     # user_id → [timestamp, ...]
+_seen_msgs       = {}     # (user_id, message_id) → timestamp, deduplicates Telegram retries
 
 # ── OPENAI CLIENT ─────────────────────────────────────────────────────────────
 
@@ -86,6 +87,16 @@ def lookup_user(user_id):
         if str(row.get("user_id")) == str(user_id):
             return row
     return None
+
+def is_duplicate_message(user_id, message_id):
+    key = (str(user_id), str(message_id))
+    now = time.time()
+    for k in [k for k, ts in _seen_msgs.items() if now - ts > 300]:
+        del _seen_msgs[k]
+    if key in _seen_msgs:
+        return True
+    _seen_msgs[key] = now
+    return False
 
 def is_rate_limited(user_id, limit=RATE_LIMIT_UNAUTH):
     now  = time.time()
@@ -276,6 +287,7 @@ def build_task_content(pending_items, user_description, author_name, source):
             ],
             max_tokens=400,
             temperature=0.3,
+            timeout=30,
         )
         parsed   = json.loads(resp.choices[0].message.content)
         ai_title = (parsed.get("title") or "").strip()[:80]
@@ -502,6 +514,10 @@ def handle_group_message(message):
     source  = chat_info.get("title", "Group")
     user_id = author_info.get("id")
 
+    if is_duplicate_message(user_id, msg_id):
+        print(f"ℹ️ Duplicate group message {msg_id} for user {user_id} — skipped")
+        return
+
     if is_rate_limited(user_id, RATE_LIMIT_AUTH):
         print(f"🚫 Rate-limited user {user_id} in group")
         return
@@ -542,6 +558,10 @@ def handle_private_message(message):
 
     text     = message.get("text") or message.get("caption") or ""
     entities = message.get("entities") or message.get("caption_entities") or []
+
+    if is_duplicate_message(user_id, msg_id):
+        print(f"ℹ️ Duplicate private message {msg_id} for user {user_id} — skipped")
+        return
 
     # /myid works for everyone — no auth or rate-limit required
     if has_command(text, entities, "/myid"):
