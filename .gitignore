@@ -5,3 +5,4 @@ env_it.yaml
 hq.env.yaml
 preconfig.sh
 .DS_Store
+.vscode/
