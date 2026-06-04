@@ -160,14 +160,19 @@ def cleanup_stale_pending():
         print(f"⚠️ cleanup_stale_pending failed: {e}")
 
 def session_clear(user_id):
+    """Delete pending rows for user. Returns True if rows were found and deleted, False if already empty."""
     try:
         sheet   = _get_spreadsheet().worksheet("Pending")
         rows    = sheet.get_all_records()
         to_del  = [i + 2 for i, r in enumerate(rows) if str(r.get("user_id")) == str(user_id)]
+        if not to_del:
+            return False
         for row_num in reversed(to_del):
             sheet.delete_rows(row_num)
+        return True
     except Exception as e:
         print(f"❌ session_clear failed: {e}")
+        return False
 
 def is_in_draft_session(user_id):
     """True if the user explicitly started a /task draft (has mode=draft rows)."""
@@ -187,7 +192,7 @@ def schedule_auto_finalize(user_id, chat_id, delay_seconds=5):
         return
     ts = timestamp_pb2.Timestamp()
     ts.FromDatetime(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=delay_seconds))
-    window    = int(time.time() // 5)  # 5-second window — deduplicates batch forwards
+    window    = int(time.time() // 10)  # 10-second window — deduplicates burst forwards
     task_name = f"{CLOUD_TASKS_QUEUE}/tasks/finalize-{user_id}-{window}"
     task = tasks_v2.Task(
         name=task_name,
@@ -216,7 +221,10 @@ def handle_auto_finalize(user_id, chat_id):
         return
     row         = lookup_user(user_id)
     author_name = str(row.get("display_name", "Unknown")) if row else "Unknown"
-    session_clear(user_id)
+    if not session_clear(user_id):
+        # Concurrent handler already cleared the session — skip to avoid duplicate task
+        print(f"⚠️ Auto-finalize for {user_id}: session already cleared by concurrent handler — skipping")
+        return
     finalize_task(user_id, chat_id, None, pending, "", author_name, "Private Chat",
                   clear_session_after=False)
 
