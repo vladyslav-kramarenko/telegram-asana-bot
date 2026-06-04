@@ -2,9 +2,13 @@
 
 FUNCTION_NAME="telegram_asana_webhook"
 CONFIG_FILE="configs/env.yaml"
+PROJECT_ID=$(grep '^PROJECT_ID:' ${CONFIG_FILE} | awk '{print $2}' | tr -d '"')
 
-echo "🚀 Deploying ${FUNCTION_NAME}..."
+[ -n "$PROJECT_ID" ] || { echo "❌ PROJECT_ID missing in ${CONFIG_FILE}"; exit 1; }
+
+echo "🚀 Deploying ${FUNCTION_NAME} to project ${PROJECT_ID}..."
 gcloud functions deploy ${FUNCTION_NAME} \
+  --project=${PROJECT_ID} \
   --runtime python312 \
   --trigger-http \
   --allow-unauthenticated \
@@ -18,6 +22,7 @@ sleep 5
 
 echo "🌐 Getting deployed function URL..."
 URL=$(gcloud functions describe ${FUNCTION_NAME} \
+  --project=${PROJECT_ID} \
   --region=us-central1 \
   --format='value(serviceConfig.uri)')
 
